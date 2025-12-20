@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: maze-lobby-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 10000
