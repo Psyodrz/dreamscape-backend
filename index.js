@@ -1,7 +1,16 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
+/**
+ * DreamScape Multiplayer Backend Server
+ *
+ * Architecture: Hybrid Server-Authoritative + P2P Relay
+ * - Server manages room state, player list, game events
+ * - P2P primary for real-time position updates
+ * - Socket.IO fallback when P2P fails
+ */
+
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
@@ -9,163 +18,356 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for simplicity (Mobile app/Web)
-    methods: ["GET", "POST"]
-  }
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
 });
 
-// Rooms state: { roomId: { players: [], state: 'lobby'|'playing', mazeSeed: number } }
-const rooms = new Map();
+// ═══════════════════════════════════════════════════════════════
+// ROOM STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
 
-io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+const rooms = new Map(); // roomCode -> RoomState
 
-  // --- CREATE ROOM ---
-  socket.on('create-room', ({ playerName, playerGender }) => {
-    // Generate 6-char code
-    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
-    // Create room state
-    rooms.set(roomCode, {
-      id: roomCode,
-      hostId: socket.id,
-      state: 'lobby',
-      mazeSeed: Math.floor(Math.random() * 1000000),
-      players: [{
-        id: socket.id,
-        name: playerName,
-        gender: playerGender,
-        isHost: true,
-        isReady: true // Host is always ready
-      }]
-    });
-    
+/**
+ * Create a new room state object
+ */
+function createRoomState(code, hostId, hostName, hostGender) {
+  return {
+    code,
+    hostId,
+    mazeSeed: Math.floor(Math.random() * 100000),
+    stage: 1,
+    state: "lobby", // lobby | playing | ended
+    createdAt: Date.now(),
+    players: new Map([
+      [hostId, createPlayerState(hostId, hostName, hostGender, true)],
+    ]),
+  };
+}
+
+/**
+ * Create a new player state object
+ */
+function createPlayerState(id, name, gender, isHost = false) {
+  return {
+    id,
+    peerId: null,
+    name: name || "Player",
+    gender: gender || "male",
+    isHost,
+    isReady: isHost, // Host is always ready
+    position: { x: 0, y: 0, z: 0 },
+    rotation: 0,
+    animState: "idle",
+    lastUpdate: Date.now(),
+    connected: true,
+  };
+}
+
+/**
+ * Generate a unique room code
+ */
+function generateRoomCode() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let code;
+  do {
+    code = Array.from(
+      { length: 6 },
+      () => chars[Math.floor(Math.random() * chars.length)]
+    ).join("");
+  } while (rooms.has(code));
+  return code;
+}
+
+/**
+ * Get room state as serializable object
+ */
+function serializeRoom(room) {
+  return {
+    code: room.code,
+    hostId: room.hostId,
+    mazeSeed: room.mazeSeed,
+    stage: room.stage,
+    state: room.state,
+    players: Array.from(room.players.values()).map(serializePlayer),
+  };
+}
+
+/**
+ * Serialize player state
+ */
+function serializePlayer(player) {
+  return {
+    id: player.id,
+    peerId: player.peerId,
+    name: player.name,
+    gender: player.gender,
+    isHost: player.isHost,
+    isReady: player.isReady,
+    position: player.position,
+    rotation: player.rotation,
+    animState: player.animState,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SOCKET.IO EVENT HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+io.on("connection", (socket) => {
+  console.log(`[CONNECT] Client: ${socket.id}`);
+
+  // Track which room this socket is in
+  let currentRoom = null;
+
+  // ─────────────────────────────────────────────────────────────
+  // ROOM MANAGEMENT
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("create-room", ({ playerName, playerGender }) => {
+    const roomCode = generateRoomCode();
+    const room = createRoomState(roomCode, socket.id, playerName, playerGender);
+    rooms.set(roomCode, room);
+    currentRoom = roomCode;
+
     socket.join(roomCode);
-    
-    console.log(`Room created: ${roomCode} by ${playerName}`);
-    
-    // Send room details back to host
-    socket.emit('room-created', {
+    console.log(`[ROOM] Created: ${roomCode} by ${playerName}`);
+
+    socket.emit("room-created", {
       roomCode,
-      playerId: socket.id,
-      players: rooms.get(roomCode).players
+      players: Array.from(room.players.values()).map(serializePlayer),
     });
   });
 
-  // --- JOIN ROOM ---
-  socket.on('join-room', ({ roomCode, playerName, playerGender }) => {
-    const room = rooms.get(roomCode);
-    
+  socket.on("join-room", ({ roomCode, playerName, playerGender }) => {
+    const code = roomCode.trim().toUpperCase();
+    const room = rooms.get(code);
+
     if (!room) {
-      socket.emit('error', { message: 'Room not found' });
+      socket.emit("error", { message: "Room not found" });
       return;
     }
-    
-    if (room.state !== 'lobby') {
-      socket.emit('error', { message: 'Game already started' });
+
+    if (room.state !== "lobby") {
+      socket.emit("error", { message: "Game already in progress" });
       return;
     }
-    
-    if (room.players.length >= 8) {
-      socket.emit('error', { message: 'Room is full' });
+
+    if (room.players.size >= 4) {
+      socket.emit("error", { message: "Room is full" });
       return;
     }
-    
-    // Add player
-    const newPlayer = {
-      id: socket.id,
-      name: playerName,
-      gender: playerGender,
-      isHost: false,
-      isReady: false
-    };
-    
-    room.players.push(newPlayer);
-    socket.join(roomCode);
-    
-    console.log(`Player ${playerName} joined room ${roomCode}`);
-    
-    // Notify joining player
-    socket.emit('joined-room', {
-      roomCode,
-      playerId: socket.id,
-      players: room.players,
-      mazeSeed: room.mazeSeed
+
+    // Add player to room
+    const player = createPlayerState(
+      socket.id,
+      playerName,
+      playerGender,
+      false
+    );
+    room.players.set(socket.id, player);
+    currentRoom = code;
+
+    socket.join(code);
+    console.log(`[ROOM] ${playerName} joined ${code}`);
+
+    // Notify everyone
+    socket.emit("joined-room", {
+      roomCode: code,
+      players: Array.from(room.players.values()).map(serializePlayer),
+      mazeSeed: room.mazeSeed,
     });
-    
-    // Notify others in room
-    socket.to(roomCode).emit('player-joined', newPlayer);
+
+    socket.to(code).emit("player-joined", {
+      player: serializePlayer(player),
+      players: Array.from(room.players.values()).map(serializePlayer),
+    });
   });
 
-  // --- PLAYER READY (For Lobby UI) ---
-  socket.on('player-ready', ({ roomCode, isReady }) => {
+  // ─────────────────────────────────────────────────────────────
+  // READY STATE
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("player-ready", ({ roomCode, isReady }) => {
     const room = rooms.get(roomCode);
     if (!room) return;
-    
-    const player = room.players.find(p => p.id === socket.id);
+
+    const player = room.players.get(socket.id);
     if (player) {
       player.isReady = isReady;
-      io.to(roomCode).emit('player-update', player);
+      io.to(roomCode).emit("player-ready-changed", {
+        playerId: socket.id,
+        isReady,
+        players: Array.from(room.players.values()).map(serializePlayer),
+      });
     }
   });
 
-  // --- START GAME ---
-  socket.on('start-game', ({ roomCode }) => {
+  // ─────────────────────────────────────────────────────────────
+  // GAME START
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("start-game", ({ roomCode, mazeSeed }) => {
     const room = rooms.get(roomCode);
     if (!room) return;
-    
-    // Safety check: Only host can start
-    if (room.hostId !== socket.id) return;
-    
-    room.state = 'playing';
-    console.log(`Starting game in room ${roomCode}`);
-    
-    // Broadcast start to ALL players in room
-    io.to(roomCode).emit('game-started', {
+
+    // Only host can start
+    if (room.hostId !== socket.id) {
+      socket.emit("error", { message: "Only host can start the game" });
+      return;
+    }
+
+    // Update room state
+    room.state = "playing";
+    room.mazeSeed = mazeSeed || room.mazeSeed;
+    room.startTime = Date.now();
+
+    console.log(`[GAME] Started in ${roomCode} with seed ${room.mazeSeed}`);
+
+    io.to(roomCode).emit("game-started", {
       mazeSeed: room.mazeSeed,
-      players: room.players // Clients will use this to know who to connect to via PeerJS
+      players: Array.from(room.players.values()).map(serializePlayer),
     });
   });
 
-  // --- EXCHANGE PEER ID ---
-  // Once clients init PeerJS, they send their ID here to share with room
-  socket.on('share-peer-id', ({ roomCode, peerId }) => {
-    console.log(`Peer ID received from ${socket.id}: ${peerId}`);
-    // Broadcast this peer ID to everyone else so they can connect
-    socket.to(roomCode).emit('peer-id-shared', {
-      socketId: socket.id,
-      peerId: peerId
+  // ─────────────────────────────────────────────────────────────
+  // P2P SIGNALING
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("share-peer-id", ({ roomCode, peerId }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+
+    const player = room.players.get(socket.id);
+    if (player) {
+      player.peerId = peerId;
+      console.log(`[P2P] Peer ID from ${player.name}: ${peerId}`);
+
+      // Broadcast to others
+      socket.to(roomCode).emit("peer-id-shared", {
+        socketId: socket.id,
+        peerId,
+        playerName: player.name,
+        playerGender: player.gender,
+      });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // POSITION SYNC (Socket.IO Fallback)
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("sync-position", ({ roomCode, position, rotation, animState }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+
+    const player = room.players.get(socket.id);
+    if (player) {
+      // Update server-side state
+      player.position = position;
+      player.rotation = rotation;
+      player.animState = animState;
+      player.lastUpdate = Date.now();
+
+      // Broadcast to others (excluding sender)
+      socket.to(roomCode).emit("player-state", {
+        playerId: socket.id,
+        position,
+        rotation,
+        animState,
+        timestamp: player.lastUpdate,
+      });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // STATE REQUESTS
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("request-state", ({ roomCode }) => {
+    const room = rooms.get(roomCode);
+    if (!room) {
+      socket.emit("error", { message: "Room not found" });
+      return;
+    }
+
+    console.log(`[STATE] Full state requested by ${socket.id}`);
+    socket.emit("full-state", serializeRoom(room));
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // GAME EVENTS
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("stage-change", ({ roomCode, stage }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+
+    // Only host can change stage
+    if (room.hostId === socket.id) {
+      room.stage = stage;
+      io.to(roomCode).emit("stage-changed", { stage });
+      console.log(`[GAME] Stage changed to ${stage} in ${roomCode}`);
+    }
+  });
+
+  socket.on("player-spawned", ({ roomCode }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+
+    console.log(`[SPAWN] Player ${socket.id} spawned in ${roomCode}`);
+    socket.to(roomCode).emit("player-spawn-confirmed", {
+      playerId: socket.id,
+      timestamp: Date.now(),
     });
   });
 
-  // --- DISCONNECT ---
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    
-    // Scan rooms to remove player
-    rooms.forEach((room, roomCode) => {
-      const index = room.players.findIndex(p => p.id === socket.id);
-      if (index !== -1) {
-        const wasHost = room.players[index].isHost;
-        room.players.splice(index, 1);
-        
-        // Notify remaining players
-        io.to(roomCode).emit('player-left', { playerId: socket.id });
-        
-        // Strict Phase 1 Requirement: Destroy room if host leaves
-        if (wasHost) {
-          console.log(`Host left room ${roomCode}. Destroying room.`);
-          io.to(roomCode).emit('room-destroyed', { reason: 'Host disconnected' });
-          rooms.delete(roomCode);
-        } else if (room.players.length === 0) {
-          rooms.delete(roomCode);
-        }
-      }
+  // ─────────────────────────────────────────────────────────────
+  // DISCONNECT
+  // ─────────────────────────────────────────────────────────────
+
+  socket.on("disconnect", () => {
+    console.log(`[DISCONNECT] Client: ${socket.id}`);
+
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    const player = room.players.get(socket.id);
+    if (!player) return;
+
+    const wasHost = player.isHost;
+    room.players.delete(socket.id);
+
+    // Notify others
+    io.to(currentRoom).emit("player-left", {
+      playerId: socket.id,
+      playerName: player.name,
     });
+
+    // Host left - destroy room
+    if (wasHost) {
+      console.log(`[ROOM] Host left ${currentRoom}, destroying room`);
+      io.to(currentRoom).emit("room-destroyed", {
+        reason: "Host disconnected",
+      });
+      rooms.delete(currentRoom);
+    }
+    // Empty room - cleanup
+    else if (room.players.size === 0) {
+      console.log(`[ROOM] Empty room ${currentRoom}, deleting`);
+      rooms.delete(currentRoom);
+    }
   });
 });
 
-const PORT = process.env.PORT || 3000;
+// ═══════════════════════════════════════════════════════════════
+// SERVER START
+// ═══════════════════════════════════════════════════════════════
+
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Lobby Server running on port ${PORT}`);
+  console.log(`🎮 DreamScape Multiplayer Server running on port ${PORT}`);
 });
